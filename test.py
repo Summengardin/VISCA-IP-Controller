@@ -16,6 +16,8 @@ def test_zoom(cam: Camera):
     cam.zoom(-7)
     time.sleep(5)
 
+    cam.zoom(0)
+
     print(f"\nZoom position: {cam.get_zoom_position()}")
     print(f"Zooming to 0.5 ({0.5*16384})\n")
     cam.zoom_to(0.5)
@@ -195,7 +197,7 @@ def test_min_shutter(cam: Camera):
 
 
 
-# test_zoom(cam) # : OK
+test_zoom(cam) # : OK
 # test_shutter(cam) # : OK
 # test_exposure_compensation(cam)
 # test_gain(cam) # : OK

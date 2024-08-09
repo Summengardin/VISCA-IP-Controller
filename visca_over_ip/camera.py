@@ -6,6 +6,7 @@ from visca_over_ip.exceptions import ViscaException, NoQueryResponse
 SEQUENCE_NUM_MAX = 2 ** 32 - 1
 
 
+
 class Camera:
     """
     Represents a camera that has a VISCA-over-IP interface.
