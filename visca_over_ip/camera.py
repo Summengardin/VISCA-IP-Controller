@@ -19,11 +19,10 @@ class Camera:
         """:param ip: the IP address or hostname of the camera you want to talk to.
         :param port: the port number to use. 52381 is the default for most cameras.
         """
-        self._location = (ip, port)
-        self._sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)  # for UDP stuff
-        self._sock.bind(('', 0))
+        self._sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)  # for TCP
+        self._sock.connect((ip, port))
         self._port = self._sock.getsockname()[1]  
-        self._sock.settimeout(0.1)
+        self._sock.settimeout(1) # 0.1
 
         self.num_missed_responses = 0
         self.sequence_number = 0  # This number is encoded in each message and incremented after sending each message
@@ -43,16 +42,20 @@ class Camera:
         preamble = b'\x81' + (b'\x09' if query else b'\x01')
         terminator = b'\xff'
 
-        payload_bytes = preamble + bytearray.fromhex(command_hex) + terminator
+        command = bytearray.fromhex(command_hex.replace(' ', ''))
+        payload_bytes = preamble + command + terminator
         payload_length = len(payload_bytes).to_bytes(2, 'big')
 
         exception = None
         for retry_num in range(self.num_retries):
             self._increment_sequence_number()
             sequence_bytes = self.sequence_number.to_bytes(4, 'big')
-            message = payload_type + payload_length + sequence_bytes + payload_bytes
+            # message = payload_type + payload_length + sequence_bytes + payload_bytes
+            message = payload_type + payload_bytes
 
-            self._sock.sendto(message, self._location)
+            self._sock.sendall(message)
+            # printable = " ".join(f'{b:02x}' for b in message)
+            # print(f'Camera sent: {printable}')
 
             try:
                 response = self._receive_response()
@@ -72,23 +75,20 @@ class Camera:
         """Attempts to receive the response of the most recent command.
         Sometimes we don't get the response because this is UDP.
         In that case we just increment num_missed_responses and move on.
+
         :raises ViscaException: if the response if an error and not an acknowledge or completion
         """
         while True:
             try:
-                response = self._sock.recv(32)
-                response_sequence_number = int.from_bytes(response[4:8], 'big')
+                response = self._sock.recv(1024)
+                # response_sequence_number = int.from_bytes(response[4:8], 'big')
 
-                if response_sequence_number < self.sequence_number:
-                    continue
-                else:
-                    response_payload = response[8:]
-                    if len(response_payload) > 2:
-                        status_byte = response_payload[1]
-                        if status_byte >> 4 not in [5, 4]:
-                            raise ViscaException(response_payload)
-                        else:
-                            return response_payload
+                if len(response) > 2:
+                    status_byte = response[1]
+                    if status_byte >> 4 not in [5, 4]:
+                        raise ViscaException(response)
+                    else:
+                        return response
 
             except socket.timeout:  # Occasionally we don't get a response because this is UDP
                 self.num_missed_responses += 1
@@ -96,7 +96,7 @@ class Camera:
 
     def reset_sequence_number(self):
         message = bytearray.fromhex('02 00 00 01 00 00 00 01 01')
-        self._sock.sendto(message, self._location)
+        self._sock.sendall(message)
         self._receive_response()
         self.sequence_number = 1
 
@@ -248,6 +248,24 @@ class Camera:
 
     def decrease_exposure_compensation(self):
         self._send_command('04 0E 03')
+
+    def set_exposure_compensation(self, value: int):
+        """Sets the exposure compensation of the camera. Exposure compensation is a function which offsets the internal reference brightness level used in the AE mode, by steps of 1.5 dB.
+
+        :param value: 0 to 14
+        """
+        if not isinstance(value, int) or value < 0 or value > 14:
+            raise ValueError('The exposure compensation must be an integer between 0 and 14 inclusive')
+        
+        value_hex = f'{value:02x}'
+        p, q = value_hex[0], value_hex[1]
+        self._send_command(f'04 0E 00 00 0{p} 0{q}')
+
+    def set_exposure_compensation_on(self):
+        self._send_command('04 3E 02') 
+
+    def set_exposure_compensation_off(self):
+        self._send_command('04 3E 03')
 
     def set_focus_mode(self, mode: str):
         """Sets the focus mode of the camera
@@ -433,12 +451,15 @@ class Camera:
 
     def set_gain(self, gain: int):
         """Sets the gain of the camera
-        :param gain: 0-255
+        :param gain: 1-15
         """
-        if not isinstance(gain, int) or gain < 0 or gain > 255:
-            raise ValueError('The gain must be an integer from 0 to 255 inclusive')
+        if not isinstance(gain, int) or gain < 1 or gain > 15:
+            raise ValueError('The gain must be an integer from 1 to 15 inclusive')
 
-        self._send_command('04 4C 00 00 ' + f'{gain:02x}')
+        gain_hex = f'{gain:02x}'
+        p, q = gain_hex[0], gain_hex[1]
+
+        self._send_command(f'04 4C 00 00 0{p} 0{q}')
 
     def increase_gain(self):
         self._send_command('04 0C 02')
@@ -451,7 +472,7 @@ class Camera:
 
     def autoexposure_mode(self, mode: str):
         """Sets the autoexposure mode of the camera
-        :param mode: One of "auto", "manual", "shutter priority", "iris priority", or "bright".
+        :param mode: One of "auto", "manual", "shutter priority", "iris priority"
             See the manual for an explanation of these modes.
         """
         modes = {
@@ -459,23 +480,25 @@ class Camera:
             'manual': '3',
             'shutter priority': 'A',
             'iris priority': 'B',
-            'bright': 'D'
         }
         mode = mode.lower()
 
         if mode not in modes:
             raise ValueError(f'"{mode}" is not a valid mode. Valid modes: {", ".join(modes.keys())}')
 
-        self._send_command('04 39 0' + modes[mode])
+        self._send_command(f'04 39 0{modes[mode]}')
 
     def set_shutter(self, shutter: int):
-        """Sets the shutter of the camera
+        """Sets the shutter of the camera. The shutter speed can be set freely by the user to a total of 22 steps – 16 high speeds and 6 low speeds.
+
         :param shutter: 0-21
         """
         if not isinstance(shutter, int) or shutter < 0 or shutter > 21:
             raise ValueError('The shutter must be an integer from 0 to 21 inclusive')
 
-        self._send_command('04 4A 00 ' + f'{shutter:02x}')
+        shutter_hex = f'{shutter:02x}'
+        p, q = shutter_hex[0], shutter_hex[1]
+        self._send_command(f'04 4A 00 00 0{p} 0{q}') 
 
     def increase_shutter(self):
         self._send_command('04 0A 02')
@@ -497,12 +520,14 @@ class Camera:
 
     def set_iris(self, iris: int):
         """Sets the iris of the camera
-        :param iris: 0-17
+        :param iris: 5-17
         """
-        if not isinstance(iris, int) or iris < 0 or iris > 17:
-            raise ValueError('The iris must be an integer from 0 to 17 inclusive')
+        if not isinstance(iris, int) or iris < 5 or iris > 17:
+            raise ValueError('The iris must be an integer from 5 to 17 inclusive')
 
-        self._send_command('04 4B 00 00 ' + f'{iris:02x}')
+        iris_hex = f'{iris:02x}'
+        p, q = iris_hex[0], iris_hex[1]
+        self._send_command(f'04 4B 00 00 0{p} 0{q}')
     
     def increase_iris(self):
         self._send_command('04 0B 02')
@@ -556,6 +581,25 @@ class Camera:
     
     def reset_aperture(self):
         self._send_command('04 02 00')
+
+    def set_min_shutter_on(self):
+        self._send_command('04 12 02')
+
+    def set_min_shutter_off(self):
+        self._send_command('04 12 03')
+
+    def set_min_shutter_position(self, shutter: int):
+        """Sets the minimum shutter position of the camera.
+        :param shutter: 5-20
+        """
+
+        if not isinstance(shutter, int) or shutter < 5 or shutter > 20:
+            raise ValueError('The shutter must be an integer from 5 to 20 inclusive')
+
+        shutter_hex = f'{shutter:02x}'
+        p, q = shutter_hex[0], shutter_hex[1]
+        self._send_command(f'04 13 00 00 0{p} 0{q}')
+
 
     def flip_horizontal(self, flip_mode: bool):
         """Sets the horizontal flip mode of the camera
@@ -642,5 +686,48 @@ class Camera:
         modes = {2: 'auto', 3: 'manual'}
         response = self._send_command('04 38', query=True)
         return modes[response[-1]]
+
+    def get_autoexposure_mode(self) -> str:
+        """:return: either 'auto', 'manual', 'shutter priority' or 'iris priority'"""
+        modes = {
+            '0': 'auto',
+            '3': 'manual',
+            'A': 'shutter priority',
+            'B': 'iris priority',
+        }
+        response = self._send_command('04 39', query=True)
+        return modes[str(hex(response[-1]))[2].upper()]
+
+    def get_shutter(self) -> int:
+        """:return: an unsigned integer representing the absolute shutter position"""
+        response = self._send_command('04 4A', query=True)
+        return self._zero_padded_bytes_to_int(response[1:], signed=False)
+
+    def get_iris(self) -> int:
+        """:return: an unsigned integer representing the absolute iris"""
+        response = self._send_command('04 4B', query=True)
+        return self._zero_padded_bytes_to_int(response[1:], signed=True)
+
+    def get_gain(self) -> int:
+        """:return: an unsigned integer representing the absolute gain"""
+        response = self._send_command('04 4C', query=True)
+        return self._zero_padded_bytes_to_int(response[1:], signed=True)
+
+    
+    def get_min_shutter(self) -> str:
+        """:return: an unsigned integer representing the minimum shutter position"""
+        response = self._send_command('04 12', query=True)
+
+        states = {
+            '2': 'On',
+            '3': 'Off',
+        }
+        return states[str(hex(response[-1]))[2].upper()]
+
+    def get_min_shutter_position(self) -> int:
+        """:return: an unsigned integer representing the minimum shutter position"""
+        response = self._send_command('04 13', query=True)
+        return self._zero_padded_bytes_to_int(response[1:], signed=False)
+
 
     # other inquiry commands
